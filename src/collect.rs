@@ -129,6 +129,7 @@ pub fn run(
     log::info(format!("采集中，每 {} 秒落盘一次", flush_secs));
 
     let flush_every = flush_secs.max(1);
+    const CLEANUP_EVERY: u64 = 86_400;
     let mut tick = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(1));
@@ -138,6 +139,10 @@ pub fn run(
             scan_alerts(&mut db, alert_bytes);
             heartbeat(&mut db);
         }
+        // 服务常开，不能只靠退出路径清理：每天删一次超期数据
+        if tick % CLEANUP_EVERY == 0 {
+            cleanup(&mut db, keep_days);
+        }
         if stop.load(Ordering::SeqCst) || duration.is_some_and(|d| tick >= d) {
             break;
         }
@@ -146,11 +151,7 @@ pub fn run(
     flush(&state, &mut db, min_bytes);
     scan_alerts(&mut db, alert_bytes);
     heartbeat(&mut db);
-    let cutoff = chrono::Local::now().timestamp() - (keep_days * 86400) as i64;
-    let removed = db.cleanup_before(cutoff).unwrap_or(0);
-    if removed > 0 {
-        log::info(format!("清理 {} 天前的旧记录 {} 条", keep_days, removed));
-    }
+    cleanup(&mut db, keep_days);
     if let Err(e) = usn::update_bookmark(&mut db, drive) {
         log::warn(format!("更新书签失败：{e}"));
     }
@@ -169,6 +170,15 @@ fn heartbeat(db: &mut Db) {
     let now = chrono::Local::now().timestamp().to_string();
     if let Err(e) = db.meta_set("last_flush", &now) {
         log::warn(format!("写采集心跳失败：{e}"));
+    }
+}
+
+/// 删除超过保留天数的旧记录（writes / usn_changes / alerts 同口径）。
+fn cleanup(db: &mut Db, keep_days: u64) {
+    let cutoff = chrono::Local::now().timestamp() - (keep_days * 86400) as i64;
+    let removed = db.cleanup_before(cutoff).unwrap_or(0);
+    if removed > 0 {
+        log::info(format!("清理 {} 天前的旧记录 {} 条", keep_days, removed));
     }
 }
 
