@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>磁盘写入监控 · C 盘</title>
+<link rel="stylesheet" href="glass.css">
+<link rel="stylesheet" href="web.css">
+<script defer src="app.js"></script>
+</head>
+<body>
+<div class="blobs"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+<div class="wrap">
+
+<header>
+  <div class="head-row">
+    <div>
+      <h1>磁盘写入监控 · C 盘</h1>
+      <div class="subtitle" id="subtitle">加载中…</div>
+    </div>
+    <div class="pills" id="pills"></div>
+  </div>
+</header>
+
+<div class="cards" id="cards"></div>
+
+<section class="card toolbar" id="toolbar">
+  <div class="tb-line">
+    <div class="tb-group" id="ranges">
+      <span class="tb-label">时间</span>
+      <button class="btn" data-last="30m">30 分</button>
+      <button class="btn" data-last="1h">1 小时</button>
+      <button class="btn" data-last="24h">24 小时</button>
+      <button class="btn" data-last="7d">7 天</button>
+      <button class="btn" data-last="30d">30 天</button>
+      <button class="btn" id="btn-custom">自定义</button>
+    </div>
+    <div class="tb-group" id="custom-range" hidden>
+      <input type="datetime-local" id="fromTs" step="1">
+      <span class="tb-sep">~</span>
+      <input type="datetime-local" id="toTs" step="1">
+      <button class="btn primary" id="btn-apply">应用</button>
+    </div>
+  </div>
+  <div class="tb-line">
+    <div class="tb-group grow">
+      <span class="tb-label">搜索</span>
+      <input type="search" id="q" class="search" placeholder="路径关键字 · 英文 ≥3 字符 / 中文 1 字即可，不区分大小写">
+    </div>
+    <div class="tb-group">
+      <span class="tb-label">进程</span>
+      <select id="proc"><option value="">全部进程</option></select>
+      <button class="btn icon" id="btn-refresh-proc" title="刷新进程列表">↻</button>
+    </div>
+  </div>
+  <div class="tb-line">
+    <div class="tabs" id="tabs">
+      <button class="tab" data-view="writes">实时写入</button>
+      <button class="tab" data-view="usn">离线补录</button>
+      <button class="tab" data-view="alerts">告警</button>
+    </div>
+    <div class="tb-group" id="groups">
+      <button class="btn sm" data-group="file">按文件</button>
+      <button class="btn sm" data-group="dir">按目录</button>
+      <button class="btn sm" data-group="none">分钟明细</button>
+    </div>
+    <div class="tb-group right">
+      <span class="tb-label">每页</span>
+      <select id="size"><option>25</option><option selected>50</option><option>100</option><option>200</option></select>
+      <label class="chk"><input type="checkbox" id="autorefresh">自动刷新表格</label>
+    </div>
+  </div>
+  <div class="loading" id="loading" hidden></div>
+</section>
+
+<div class="err" id="err" hidden></div>
+
+<section class="card" id="chart-card">
+  <h2>写入节奏 <small>按小时 · 点击柱体选定该小时</small></h2>
+  <div class="chart" id="chart"></div>
+</section>
+
+<div class="cols2">
+  <section class="card" id="procs-card">
+    <h2>写入最多的进程 <small>Top 10 · 点击过滤</small></h2>
+    <div id="procs"></div>
+  </section>
+  <section class="card" id="dirs-card">
+    <h2>写入最多的目录 <small>Top 8 · 点击过滤</small></h2>
+    <div id="dirs"></div>
+  </section>
+</div>
+
+<section class="card tablewrap">
+  <div class="table-head">
+    <h2 id="table-title">—</h2>
+    <div class="table-count" id="table-count"></div>
+  </div>
+  <div id="view-note"></div>
+  <table>
+    <thead><tr id="thead-row"></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="pager" id="pager"></div>
+</section>
+
+<footer id="page-footer">diskwatch · 加载中…</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,12 @@
+/target
+
+# 运行时产物：数据库、日志、报告（生产数据不进版本库）
+/bin/data/
+/bin/logs/
+/bin/reports/
+
+# 二进制：部署副本与历史备份
+/bin/*.exe
+
+# 冒烟运行日志
+/smoke.log
