@@ -1,5 +1,10 @@
 /* Web 界面专属样式，叠加在 glass.css 基座上。
    本文件必须保存为 UTF-8（无 BOM），中文 Windows 记事本默认 ANSI 会导致 include_str! 编译失败。 */
+
+/* 作者样式表优先级高于 UA 样式表：.tb-group{display:flex} / .cards{display:grid} 会盖掉
+   浏览器默认的 [hidden]{display:none}，靠 hidden 属性显隐的元素于是从不隐藏。全局兜住。 */
+[hidden] { display: none !important; }
+
 .head-row { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
 .pills { display: flex; gap: 8px; flex-wrap: wrap; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; font-size: 11.5px;
