@@ -498,40 +498,76 @@ function renderCards(t) {
   mk(240, '最大单文件', max, humanBytes, t.max_file_path || '', t.max_file_path || '');
 }
 
+const CHART_STEPS = [1, 2, 3, 6, 12, 24, 48, 168];
+const CHART_GAP = 8;
+const CHART_MIN_COL = 20;
+const CHART_LABEL_W = 40;
+const TZ_SEC = -new Date().getTimezoneOffset() * 60;
+let lastHourly = [];
+function stepDur(step) { return step >= 24 ? step / 24 + '天' : step + '小时'; }
+function fmtMd(ts) { const d = new Date(ts * 1000); return p2(d.getMonth() + 1) + '-' + p2(d.getDate()); }
+function fmtAxis(ts, step) {
+  if (step >= 24) return fmtMd(ts);
+  const d = new Date(ts * 1000);
+  return (d.getHours() === 0 && d.getMinutes() === 0) ? fmtMd(ts) : fmtHM(ts);
+}
+
 function renderChart(hourly) {
+  lastHourly = hourly || [];
   const chart = $('chart');
   chart.textContent = '';
-  if (!hourly || hourly.length === 0) {
+  const cap = $('chart-caption');
+  if (!lastHourly.length) {
     chart.appendChild(el('div', 'note', '窗口内没有数据'));
+    if (cap) cap.textContent = '按小时 · 点击柱体选定该区间';
     return;
   }
-  let step = 1;
-  for (const m of [1, 6, 24]) {
-    step = m;
-    if (Math.ceil(hourly.length / m) <= 60) break;
+  // 桶数必须跟着卡片宽度走：写死上限会让长窗口的横轴溢出卡片，
+  // 而溢出的恰好是最右边那几天——最新数据反而看不见。
+  const maxBars = Math.max(6, Math.floor((chart.clientWidth + CHART_GAP) / (CHART_MIN_COL + CHART_GAP)));
+  let step = CHART_STEPS[CHART_STEPS.length - 1];
+  for (const s of CHART_STEPS) {
+    if (Math.ceil(lastHourly.length / s) <= maxBars) { step = s; break; }
   }
   const bucketSec = step * 3600;
-  const buckets = [];
-  for (let i = 0; i < hourly.length; i += step) {
-    const slice = hourly.slice(i, i + step);
-    buckets.push([slice[0][0], slice.reduce((s, x) => s + x[1], 0)]);
+  // 桶必须对齐到本地日界：跟着窗口起点切会得出"16:00 起一天"这种假边界，
+  // 每次刷新都在漂移，横轴也就读不出节律了。
+  const acc = new Map();
+  for (const [ts, bytes] of lastHourly) {
+    const k = Math.floor((ts + TZ_SEC) / bucketSec) * bucketSec - TZ_SEC;
+    acc.set(k, (acc.get(k) || 0) + bytes);
   }
+  const buckets = [...acc.entries()].sort((a, b) => a[0] - b[0]);
   const max = buckets.reduce((m, b) => Math.max(m, b[1]), 0);
   const fromNum = S.from ? Number(S.from) : null;
+  const stride = (chart.clientWidth + CHART_GAP) / buckets.length;
+  const every = Math.max(1, Math.ceil(CHART_LABEL_W / stride));
   buckets.forEach(([h, v], i) => {
     const col = el('div', 'chart-col');
+    const plot = el('div', 'chart-plot');
     const bar = el('span', 'chart-bar');
-    bar.style.height = (max > 0 ? Math.max(v > 0 ? 4 : 0, (v / max) * 100) : 0) + '%';
+    bar.style.height = (max > 0 && v > 0 ? Math.max(4, Math.sqrt(v / max) * 100) : 0) + '%';
     bar.style.animationDelay = (i * 30) + 'ms';
-    bar.title = `${fmtFull(h)} 起 ${step} 小时 — ${humanBytes(v)}`;
+    bar.title = `${fmtFull(h)} 起 ${stepDur(step)} — ${humanBytes(v)}`;
     if (fromNum !== null && fromNum >= h && fromNum < h + bucketSec) bar.classList.add('active');
-    col.appendChild(bar);
-    col.appendChild(el('span', 'chart-h', step === 1 ? fmtHM(h) : fmtMdHM(h)));
+    plot.appendChild(bar);
+    col.appendChild(plot);
+    // 标签比柱体宽得多，只按间隔留字，其余留空占位保持等高。
+    col.appendChild(el('span', 'chart-h', i % every === 0 ? fmtAxis(h, step) : ''));
     col.style.cursor = 'pointer';
     col.addEventListener('click', () => applyPatch({ from: String(h), to: String(h + bucketSec), offset: 0 }, true));
     chart.appendChild(col);
   });
+  if (cap) cap.textContent = `按${stepDur(step)}聚合 · 柱高平方根缩放 · 点击柱体选定该区间`;
 }
+
+let chartResizeTimer = null;
+addEventListener('resize', () => {
+  clearTimeout(chartResizeTimer);
+  chartResizeTimer = setTimeout(() => {
+    if (!$('chart-card').hidden && lastHourly.length) renderChart(lastHourly);
+  }, 150);
+});
 
 function renderBarRow(container, label, bytes, max, sub, delay, onClick) {
   const row = el('div', 'bar-row');
