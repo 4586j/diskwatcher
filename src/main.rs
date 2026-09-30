@@ -1,8 +1,10 @@
 mod alert;
 mod assets;
 mod collect;
+mod csv;
 mod db;
 mod eventlog;
+mod export;
 mod log;
 mod report;
 mod service;
@@ -100,6 +102,24 @@ enum Cmd {
         /// 路径过滤子串
         #[arg(long)]
         contains: Option<String>,
+    },
+    /// 导出 CSV（writes / usn / alerts 各一份，Excel 可直接打开）
+    Export {
+        /// 统计最近时间段，如 30m / 1h / 7d
+        #[arg(long, default_value = "24h")]
+        last: String,
+        /// 输出目录（默认 <程序目录>/exports/）
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// 路径过滤子串
+        #[arg(long)]
+        contains: Option<String>,
+        /// 进程名精确过滤（离线补录视图无进程维度，会忽略此项）
+        #[arg(long)]
+        process: Option<String>,
+        /// 实时写入视图的聚合维度：file / dir / none（分钟明细）
+        #[arg(long, default_value = "file")]
+        by: String,
     },
 }
 
@@ -212,5 +232,19 @@ fn main() -> Result<()> {
             limit,
             contains,
         } => top::run(&db_path, &last, &by, limit, contains.as_deref()),
+        Cmd::Export {
+            last,
+            out,
+            contains,
+            process,
+            by,
+        } => export::run_cli(
+            &db_path,
+            &last,
+            out,
+            contains.as_deref().unwrap_or(""),
+            process.as_deref().unwrap_or(""),
+            &by,
+        ),
     }
 }

@@ -708,6 +708,15 @@ function mainParams() {
   if (S.view === 'writes' || S.view === 'usn') p.group = S.group;
   return p;
 }
+// 导出走的是全窗口，不是屏幕上这 50 行：继承筛选与聚合粒度，丢掉分页和排序。
+function exportParams() {
+  const p = mainParams();
+  delete p.limit;
+  delete p.offset;
+  delete p.sort;
+  delete p.order;
+  return p;
+}
 async function loadMain() {
   const gen = loadGen;
   loading(1);
@@ -850,6 +859,35 @@ function wire() {
   });
   $('proc').addEventListener('change', () => applyPatch({ process: $('proc').value, offset: 0 }, true));
   $('btn-refresh-proc').addEventListener('click', () => loadProcs());
+  // 响应是 CSV 不是 JSON，不能走 api()；先验内容类型再落地，避免把错误页存成 .csv。
+  $('btn-export').addEventListener('click', async () => {
+    if (S.mock) { setError('mock 预览页没有真实数据，无法导出'); return; }
+    const qs = new URLSearchParams(exportParams()).toString();
+    const url = '/api/export/' + S.view + (qs ? '?' + qs : '');
+    $('btn-export').disabled = true;
+    try {
+      const res = await fetch(url);
+      const ctype = res.headers.get('Content-Type') || '';
+      if (!res.ok || ctype.indexOf('text/csv') < 0) {
+        const j = await res.json().catch(() => null);
+        throw new Error(j && j.error ? j.error.message : '导出失败 (' + res.status + ')');
+      }
+      const m = (res.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/);
+      const href = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = m ? m[1] : 'diskwatch-' + S.view + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 60000);
+      setError(null);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      $('btn-export').disabled = false;
+    }
+  });
   $('tabs').addEventListener('click', ev => {
     const b = ev.target.closest('.tab');
     if (b) applyPatch({ view: b.dataset.view, offset: 0 }, true);

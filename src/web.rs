@@ -26,6 +26,7 @@ use chrono::Local;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::db::{self, AlertRow, Db, FileAggRow, Group, Order, PageQuery, Paged, Range, RawWriteRow, SortKey, UsnAggRow};
+use crate::export;
 use crate::log;
 
 /// 服务态硬编码端口（binPath 参数化留五期）。
@@ -182,6 +183,12 @@ struct Args {
 }
 
 fn api(ctx: &Ctx, path: &str, p: &Params) -> Body {
+    if let Some(slug) = path.strip_prefix("/api/export/") {
+        return match export::View::parse(slug) {
+            Some(view) => respond(path, api_export(ctx, view, p)),
+            None => error(404, "not_found", &format!("未知接口 {path}")),
+        };
+    }
     let r = match path {
         "/api/overview" => api_overview(ctx, p),
         "/api/writes" => api_writes(ctx, p),
@@ -191,6 +198,10 @@ fn api(ctx: &Ctx, path: &str, p: &Params) -> Body {
         "/api/status" => api_status(ctx),
         other => return error(404, "not_found", &format!("未知接口 {other}")),
     };
+    respond(path, r)
+}
+
+fn respond(path: &str, r: Result<Body, ApiError>) -> Body {
     match r {
         Ok(body) => body,
         Err(ApiError::Bad(msg)) => error(400, "bad_request", &msg),
@@ -200,6 +211,30 @@ fn api(ctx: &Ctx, path: &str, p: &Params) -> Body {
             error(500, "internal", "查询失败，详见 diskwatch.log")
         }
     }
+}
+
+/// 导出当前视图的全量 CSV。参数校验完全复用 Args::parse，
+/// 排序/分页字段被忽略：导出给 Excel 的是整个窗口，不是屏幕上的 50 行。
+fn api_export(ctx: &Ctx, view: export::View, p: &Params) -> Result<Body, ApiError> {
+    let kind = match view {
+        export::View::Writes => Kind::Writes,
+        export::View::Usn => Kind::Usn,
+        export::View::Alerts => Kind::Alerts,
+    };
+    if kind == Kind::Usn && !p.get("process").map(|s| s.is_empty()).unwrap_or(true) {
+        return Err(bad("离线补录数据没有进程维度，不支持 process 参数"));
+    }
+    let a = Args::parse(p, kind)?;
+    let buf = export::build(&ctx.db, view, a.range, &a.q, &a.process, a.group).map_err(internal)?;
+    let name = export::filename(view, a.range);
+    // 文件名由服务端按视图+窗口日期生成，不含用户输入，无需转义。
+    let disposition = format!("attachment; filename=\"{name}\"");
+    Ok(Response::from_data(buf)
+        .with_header(hdr(&b"Content-Type"[..], &b"text/csv; charset=utf-8"[..]))
+        .with_header(hdr(
+            &b"Content-Disposition"[..],
+            disposition.as_bytes(),
+        )))
 }
 
 fn api_writes(ctx: &Ctx, p: &Params) -> Result<Body, ApiError> {
@@ -737,6 +772,28 @@ mod tests {
         body(&resp)
     }
 
+    /// 导出响应是 text/csv，`body()` 的 JSON 解析用不上，这里直接拆头与体。
+    fn csv_raw(port: u16, path: &str) -> (String, String) {
+        let resp = http_get(port, path, "127.0.0.1");
+        assert_eq!(code(&resp), 200, "导出响应异常: {resp}");
+        let (head, b) = resp
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("响应没有头部结束符: {resp}"));
+        (head.to_string(), b.to_string())
+    }
+
+    /// CSV 数据行数：去掉 BOM、去掉表头；种子数据里没有含换行的路径，按行计是准的。
+    fn csv_rows(port: u16, path: &str) -> (String, usize) {
+        let (head, text) = csv_raw(port, path);
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let n = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+            .saturating_sub(1);
+        (head, n)
+    }
+
     #[test]
     fn host_accepts_loopback_forms() {
         assert!(host_is_local("127.0.0.1"));
@@ -1046,6 +1103,49 @@ mod tests {
             assert_eq!(code(&resp), want, "{why} 应回 {want}: {resp}");
             assert_eq!(body(&resp)["ok"], false, "{why} 错误体必须带 ok:false");
         }
+
+        // ---------- CSV 导出 ----------
+        let (head, rows) = csv_rows(port, "/api/export/writes?last=1h");
+        let h = head.to_lowercase();
+        assert!(h.contains("content-type: text/csv"), "导出必须声明 CSV: {head}");
+        assert!(h.contains("attachment; filename="), "必须触发下载: {head}");
+        assert!(
+            h.contains("diskwatch-writes-"),
+            "文件名要带视图名和日期: {head}"
+        );
+        assert_eq!(rows, 3, "按文件聚合 = 3 个不同路径");
+
+        // 分页与排序参数必须被忽略：导出的是整个窗口，不是屏幕上那一页。
+        let (_, rows) = csv_rows(port, "/api/export/writes?last=1h&limit=1&offset=9&sort=path");
+        assert_eq!(rows, 3, "limit/offset/sort 不得缩小导出范围");
+
+        let (_, text) = csv_raw(port, "/api/export/writes?last=1h");
+        assert!(
+            text.starts_with('\u{feff}'),
+            "Excel 需要 UTF-8 BOM 才不认成 ANSI"
+        );
+        assert!(text.contains("时间范围起,时间范围止,文件路径,字节数,操作次数,进程"));
+        assert!(
+            text.contains(r"C:\tmp\报表.xlsx"),
+            "中文路径必须原样进 CSV: {text}"
+        );
+
+        let (_, rows) = csv_rows(port, "/api/export/writes?last=1h&group=dir");
+        assert_eq!(rows, 2, "目录粒度折成 C:\\tmp 与 C:\\bin");
+        let (_, rows) = csv_rows(port, "/api/export/writes?last=1h&group=none");
+        assert_eq!(rows, 4, "分钟明细是一行一个落盘桶");
+        let (_, rows) = csv_rows(port, "/api/export/writes?last=1h&q=%E6%8A%A5%E8%A1%A8");
+        assert_eq!(rows, 1, "搜索关键字必须贯穿导出");
+
+        let (_, rows) = csv_rows(port, "/api/export/usn?last=24h");
+        assert_eq!(rows, 1);
+        let (_, rows) = csv_rows(port, "/api/export/alerts?last=1h");
+        assert_eq!(rows, 4);
+
+        let resp = http_get(port, "/api/export/usn?last=24h&process=excel.exe", "127.0.0.1");
+        assert_eq!(code(&resp), 400, "离线补录没有进程维度");
+        let resp = http_get(port, "/api/export/nope", "127.0.0.1");
+        assert_eq!(code(&resp), 404, "未知导出视图应回 404");
 
         stop.store(true, Ordering::SeqCst);
         served.join().unwrap().expect("serve 返回错误");

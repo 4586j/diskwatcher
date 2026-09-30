@@ -433,6 +433,51 @@ impl Db {
         Ok(Paged::build(q, total, rows, false))
     }
 
+    pub fn all_writes(&self, range: Range, q: &str, process: &str) -> Result<Vec<FileAggRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT path, SUM(bytes) AS bytes, SUM(ops) AS ops, MIN(ts) AS t0, MAX(ts) AS t1,
+                    GROUP_CONCAT(DISTINCT process) AS process
+             FROM writes WHERE {W_WHERE} GROUP BY path ORDER BY bytes DESC"
+        ))?;
+        let rows = stmt
+            .query_map(params![range.from, range.to, q, process], map_file_agg)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn all_writes_raw(&self, range: Range, q: &str, process: &str) -> Result<Vec<RawWriteRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT path, bytes, ops, ts, process FROM writes WHERE {W_WHERE} ORDER BY ts"
+        ))?;
+        let rows = stmt
+            .query_map(
+                params![range.from, range.to, q, process],
+                map_raw_write,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn all_usn(&self, range: Range, q: &str) -> Result<Vec<UsnAggRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT path, bytes, ts FROM usn_changes WHERE {U_WHERE} ORDER BY ts"
+        ))?;
+        let rows = stmt
+            .query_map(params![range.from, range.to, q], map_usn)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn all_alerts(&self, range: Range, q: &str, process: &str) -> Result<Vec<AlertRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT rowid, ts, path, process, bytes, notified FROM alerts WHERE {A_WHERE} ORDER BY ts"
+        ))?;
+        let rows = stmt
+            .query_map(params![range.from, range.to, q, process, -1i64], map_alert)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn counts(&self) -> Result<DbCounts> {
         self.0
             .query_row(
@@ -731,7 +776,7 @@ fn slice_page<T>(rows: Vec<T>, q: &PageQuery) -> Vec<T> {
 }
 
 /// 目录口径同 top.rs：最后一个反斜杠之前；盘符根下的文件归到 "C:\"。
-fn parent_dir(path: &str) -> &str {
+pub(crate) fn parent_dir(path: &str) -> &str {
     match path.rfind('\\') {
         Some(i) if i > 2 => &path[..i],
         Some(2) => &path[..3],
@@ -739,7 +784,7 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
-fn fold_writes_dirs(rows: Vec<FileAggRow>) -> Vec<FileAggRow> {
+pub(crate) fn fold_writes_dirs(rows: Vec<FileAggRow>) -> Vec<FileAggRow> {
     let mut map: BTreeMap<String, FileAggRow> = BTreeMap::new();
     let mut procs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for r in rows {
@@ -772,7 +817,7 @@ fn fold_writes_dirs(rows: Vec<FileAggRow>) -> Vec<FileAggRow> {
     map.into_values().collect()
 }
 
-fn fold_usn_dirs(rows: Vec<UsnAggRow>) -> Vec<UsnAggRow> {
+pub(crate) fn fold_usn_dirs(rows: Vec<UsnAggRow>) -> Vec<UsnAggRow> {
     let mut map: BTreeMap<String, UsnAggRow> = BTreeMap::new();
     for r in rows {
         let dir = parent_dir(&r.path).to_string();
