@@ -5,8 +5,9 @@
 /bin/logs/
 /bin/reports/
 
-# 二进制：部署副本与历史备份
+# 二进制：部署副本与历史备份（备份名形如 diskwatch.exe.bak-20260903，扩展名已变，须单独匹配）
 /bin/*.exe
+/bin/*.exe.bak-*
 
 # 冒烟运行日志
 /smoke.log
