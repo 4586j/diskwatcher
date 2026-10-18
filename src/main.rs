@@ -93,7 +93,7 @@ enum Cmd {
         /// 统计最近时间段，如 30m / 1h / 2d
         #[arg(long, default_value = "1h")]
         last: String,
-        /// 聚合维度：file（按文件）或 dir（按所在目录）
+        /// 聚合维度：file（按文件）/ dir（按所在目录）/ process（按进程）
         #[arg(long, default_value = "file")]
         by: String,
         /// 显示前多少条
@@ -102,6 +102,9 @@ enum Cmd {
         /// 路径过滤子串
         #[arg(long)]
         contains: Option<String>,
+        /// 输出 JSON（给脚本/agent 消费，替代文本对齐表；仅 stdout，无其他输出）
+        #[arg(long)]
+        json: bool,
     },
     /// 导出 CSV（writes / usn / alerts 各一份，Excel 可直接打开）
     Export {
@@ -231,7 +234,15 @@ fn main() -> Result<()> {
             by,
             limit,
             contains,
-        } => top::run(&db_path, &last, &by, limit, contains.as_deref()),
+            json,
+        } => top::run(
+            &db_path,
+            &last,
+            &by,
+            limit,
+            contains.as_deref(),
+            json,
+        ),
         Cmd::Export {
             last,
             out,
