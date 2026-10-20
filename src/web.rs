@@ -27,12 +27,18 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::db::{self, AlertRow, Db, FileAggRow, Group, Order, PageQuery, Paged, Range, RawWriteRow, SortKey, UsnAggRow};
 use crate::export;
+use crate::footprint::{self, Usage};
 use crate::log;
 
 /// 服务态硬编码端口（binPath 参数化留五期）。
 pub const DEFAULT_PORT: u16 = 8421;
 
 const POLL: Duration = Duration::from_secs(1);
+/// 现值缓存存活期：自动刷新会反复量同一批目录，而目录占用秒级内不会变。
+const FOOTPRINT_TTL: Duration = Duration::from_secs(60);
+/// 单个请求最多量多少个路径。目录要递归，翻页到 500 行时全量扫描会把串行队列堵死；
+/// 超出的行返回未测，页面显示为「—」。
+const FOOTPRINT_MAX_ROWS: usize = 80;
 
 type Body = Response<Cursor<Vec<u8>>>;
 
@@ -50,6 +56,7 @@ pub fn serve(db_path: &Path, port: u16, stop: Arc<AtomicBool>) -> Result<()> {
         port,
         started: Instant::now(),
         db,
+        foot: footprint::Cache::new(FOOTPRINT_TTL),
     };
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -70,6 +77,20 @@ struct Ctx {
     port: u16,
     started: Instant,
     db: Db,
+    /// 当前磁盘占用缓存；只在 usage=1 的请求里被填，未开启时连扫都不扫。
+    foot: footprint::Cache,
+}
+
+/// 取一页排行的现值，与 rows 按序号对齐。`usage=false` 或未测到的尾部一律 Unmeasured，
+/// JSON 里挂 null（见 footprint::attach_usage），前端渲染成「—」而不是 0。
+fn usage_of(ctx: &Ctx, paths: &[String], usage: bool) -> Vec<Usage> {
+    if !usage || paths.is_empty() {
+        return Vec::new();
+    }
+    let head = &paths[..paths.len().min(FOOTPRINT_MAX_ROWS)];
+    let mut us = ctx.foot.of_paths(head, footprint::Budget::WEB);
+    us.resize(paths.len(), Usage::default());
+    us
 }
 
 fn route(ctx: &Ctx, req: Request) {
@@ -180,6 +201,8 @@ struct Args {
     q: String,
     process: String,
     notified: Option<i64>,
+    /// usage=1 才测量当前磁盘占用：默认关闭，避免每次自动刷新都去扫盘。
+    usage: bool,
 }
 
 fn api(ctx: &Ctx, path: &str, p: &Params) -> Body {
@@ -225,7 +248,8 @@ fn api_export(ctx: &Ctx, view: export::View, p: &Params) -> Result<Body, ApiErro
         return Err(bad("离线补录数据没有进程维度，不支持 process 参数"));
     }
     let a = Args::parse(p, kind)?;
-    let buf = export::build(&ctx.db, view, a.range, &a.q, &a.process, a.group).map_err(internal)?;
+    let buf =
+        export::build(&ctx.db, view, a.range, &a.q, &a.process, a.group, a.usage).map_err(internal)?;
     let name = export::filename(view, a.range);
     // 文件名由服务端按视图+窗口日期生成，不含用户输入，无需转义。
     let disposition = format!("attachment; filename=\"{name}\"");
@@ -243,13 +267,16 @@ fn api_writes(ctx: &Ctx, p: &Params) -> Result<Body, ApiError> {
     let (page, rows) = match a.group {
         Group::File => {
             let r = ctx.db.writes_by_file(&q).map_err(internal)?;
-            (page_json(&r), file_json(&r.rows))
+            let us = usage_of(ctx, &paths_of(&r.rows), a.usage);
+            (page_json(&r), file_json(&r.rows, &us))
         }
         Group::Dir => {
             let r = ctx.db.writes_by_dir(&q).map_err(internal)?;
-            (page_json(&r), file_json(&r.rows))
+            let us = usage_of(ctx, &paths_of(&r.rows), a.usage);
+            (page_json(&r), file_json(&r.rows, &us))
         }
         Group::Raw => {
+            // 分钟明细同一路径会重复出现，逐行再扫一次只是把重复摊到每次扫描上
             let r = ctx.db.writes_raw(&q).map_err(internal)?;
             (page_json(&r), raw_json(&r.rows))
         }
@@ -294,6 +321,8 @@ fn api_overview(ctx: &Ctx, p: &Params) -> Result<Body, ApiError> {
     dq.sort = SortKey::Bytes;
     dq.order = Order::Desc;
     let dirs = ctx.db.writes_by_dir(&dq).map_err(internal)?;
+    // 目录卡片是"该去清哪里"的第一眼依据，光有写入量会把已删除的临时文件也排进前三
+    let dir_usage = usage_of(ctx, &paths_of(&dirs.rows), a.usage);
     let hourly: Vec<serde_json::Value> = db::fill_hours(&hours, r)
         .into_iter()
         .map(|(h, b)| serde_json::json!([h, b]))
@@ -315,9 +344,12 @@ fn api_overview(ctx: &Ctx, p: &Params) -> Result<Body, ApiError> {
             "procs": procs.iter().map(|x| serde_json::json!({
                 "process": x.process, "bytes": x.bytes, "ops": x.ops, "files": x.files,
             })).collect::<Vec<_>>(),
-            "dirs": dirs.rows.iter().map(|x| serde_json::json!({
-                "dir": x.path, "bytes": x.bytes, "ops": x.ops,
-            })).collect::<Vec<_>>(),
+            "dirs": dirs.rows.iter().enumerate().map(|(i, x)| footprint::attach_usage(
+                serde_json::json!({
+                    "dir": x.path, "bytes": x.bytes, "ops": x.ops,
+                }),
+                dir_usage.get(i),
+            )).collect::<Vec<_>>(),
         }),
     ))
 }
@@ -454,6 +486,11 @@ impl Args {
             Some("1") => Some(1),
             Some(other) => return Err(bad(format!("notified 只支持 0 / 1，收到 {other}"))),
         };
+        let usage = match p.get("usage").map(|s| s.as_str()) {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(other) => return Err(bad(format!("usage 只支持 0 / 1，收到 {other}"))),
+        };
         Ok(Args {
             range,
             last,
@@ -465,6 +502,7 @@ impl Args {
             q,
             process,
             notified,
+            usage,
         })
     }
 
@@ -499,6 +537,7 @@ impl Args {
             "q": q,
             "process": process,
             "group": group_label(self.group),
+            "usage": self.usage,
         })
     }
 }
@@ -625,13 +664,21 @@ fn page_json<T>(p: &Paged<T>) -> serde_json::Value {
     })
 }
 
-fn file_json(rows: &[FileAggRow]) -> serde_json::Value {
+fn paths_of(rows: &[FileAggRow]) -> Vec<String> {
+    rows.iter().map(|r| r.path.clone()).collect()
+}
+
+fn file_json(rows: &[FileAggRow], us: &[Usage]) -> serde_json::Value {
     rows.iter()
-        .map(|r| {
-            serde_json::json!({
-                "path": r.path, "bytes": r.bytes, "ops": r.ops,
-                "t0": r.t0, "t1": r.t1, "process": r.process,
-            })
+        .enumerate()
+        .map(|(i, r)| {
+            footprint::attach_usage(
+                serde_json::json!({
+                    "path": r.path, "bytes": r.bytes, "ops": r.ops,
+                    "t0": r.t0, "t1": r.t1, "process": r.process,
+                }),
+                us.get(i),
+            )
         })
         .collect()
 }
@@ -1022,6 +1069,25 @@ mod tests {
         assert_eq!(j["rows"][0]["ops"], 8);
         assert_eq!(j["page"]["truncated"], false);
 
+        // usage=1 才扫盘：字段必须齐（具体值取决于本机磁盘上有没有这些样例路径）
+        let j = get_json(port, "/api/writes?last=1h&group=dir&usage=1");
+        assert_eq!(j["query"]["usage"], true);
+        let st = j["rows"][0]["usage_state"].as_str().unwrap_or("");
+        assert!(matches!(st, "exact" | "partial" | "missing" | "denied"), "got {st}");
+        assert!(j["rows"][0]["usage_bytes"].is_i64());
+        // 默认不测：字段为 null 而不是 0，0 会被页面和脚本读成"这个目录不占空间"
+        let j = get_json(port, "/api/writes?last=1h&group=dir");
+        assert_eq!(j["query"]["usage"], false);
+        assert_eq!(j["rows"][0]["usage_bytes"], serde_json::Value::Null);
+        assert_eq!(j["rows"][0]["usage_state"], serde_json::Value::Null);
+        let j = get_json(port, "/api/writes?last=1h&group=none&usage=1");
+        assert_eq!(
+            j["rows"][0]["usage_state"],
+            serde_json::Value::Null,
+            "分钟明细没有现值列"
+        );
+        assert!(Args::parse(&parse_query_str("usage=2"), Kind::Writes).is_err());
+
         let j = get_json(port, "/api/writes?last=1h&group=none&sort=ts&order=asc");
         assert_eq!(j["page"]["total"], 4, "明细是落盘桶行数");
         assert_eq!(j["rows"][0]["ts"], now - 300);
@@ -1065,6 +1131,16 @@ mod tests {
         assert_eq!(j["procs"][0]["files"], 1);
         assert_eq!(j["dirs"][0]["dir"].as_str(), Some(r"C:\tmp"));
         assert_eq!(j["dirs"][0]["bytes"], 1100);
+        assert_eq!(
+            j["dirs"][0]["usage_state"],
+            serde_json::Value::Null,
+            "overview 默认不扫盘"
+        );
+
+        // 目录卡片的现值：写入量第一的目录可能早就被回收了，卡片必须说清现在还占不占
+        let j = get_json(port, "/api/overview?last=1h&usage=1");
+        let st = j["dirs"][0]["usage_state"].as_str().unwrap_or("");
+        assert!(matches!(st, "exact" | "partial" | "missing" | "denied"), "got {st}");
 
         // 关键字贯穿 overview 的每个部件，统计卡才不会和表格打架。
         let j = get_json(port, "/api/overview?last=1h&q=a.log");

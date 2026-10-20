@@ -7,22 +7,35 @@ use std::io::{self, Write};
 use chrono::{Local, TimeZone};
 
 use crate::db::{AlertRow, FileAggRow, RawWriteRow, UsnAggRow};
+use crate::footprint::{self, Usage};
 
 const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
-pub fn writes_csv(w: &mut dyn Write, rows: &[FileAggRow]) -> io::Result<()> {
+/// `us` 与 `rows` 按序号对齐；缺项（未测、或调用方跳过扫描）写空字节数 + 「未测」，
+/// 表头恒定不变，Excel 模板不会因为一次 --no-usage 就错位。
+pub fn writes_csv(w: &mut dyn Write, rows: &[FileAggRow], us: &[Usage]) -> io::Result<()> {
     w.write_all(BOM)?;
-    writeln!(w, "时间范围起,时间范围止,文件路径,字节数,操作次数,进程")?;
-    for r in rows {
+    writeln!(
+        w,
+        "时间范围起,时间范围止,文件路径,字节数,操作次数,进程,当前占用字节,占用状态"
+    )?;
+    for (i, r) in rows.iter().enumerate() {
+        let u = us.get(i).filter(|u| u.state != footprint::State::Unmeasured);
+        let (usage_bytes, usage_state) = match u {
+            Some(u) => (u.bytes.to_string(), u.state.label().to_string()),
+            None => (String::new(), "未测".to_string()),
+        };
         writeln!(
             w,
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             fmt_ts(r.t0),
             fmt_ts(r.t1),
             esc(&r.path),
             r.bytes,
             r.ops,
-            esc(&r.process)
+            esc(&r.process),
+            usage_bytes,
+            usage_state
         )?;
     }
     Ok(())
@@ -116,9 +129,11 @@ mod tests {
     #[test]
     fn headers_present_with_no_rows() {
         let mut v = Vec::new();
-        writes_csv(&mut v, &[]).unwrap();
+        writes_csv(&mut v, &[], &[]).unwrap();
         assert_eq!(body(&v).lines().count(), 1);
-        assert!(body(&v).starts_with("时间范围起,时间范围止,文件路径,字节数,操作次数,进程"));
+        assert!(body(&v).starts_with(
+            "时间范围起,时间范围止,文件路径,字节数,操作次数,进程,当前占用字节,占用状态"
+        ));
 
         let mut v = Vec::new();
         writes_raw_csv(&mut v, &[]).unwrap();
@@ -143,14 +158,45 @@ mod tests {
             t1: 1_700_000_060,
             process: "excel.exe".to_string(),
         }];
+        let us = [Usage {
+            bytes: 512,
+            files: 1,
+            state: footprint::State::Exact,
+        }];
         let mut v = Vec::new();
-        writes_csv(&mut v, &rows).unwrap();
+        writes_csv(&mut v, &rows, &us).unwrap();
         let text = body(&v);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains(r"D:\报表\数据.xlsx"));
         assert!(lines[1].contains(",1024,3,"), "字节数不能预格式化");
+        assert!(lines[1].ends_with(",512,完整"), "现值也要原始字节数");
         assert!(lines[1].starts_with("2023-11-"), "时间要是本地时区可读串");
+    }
+
+    #[test]
+    fn unmeasured_row_leaves_usage_blank_not_zero() {
+        let rows = [FileAggRow {
+            path: r"C:\a.log".to_string(),
+            bytes: 1024,
+            ops: 3,
+            t0: 1,
+            t1: 1,
+            process: "a.exe".to_string(),
+        }];
+        let mut v = Vec::new();
+        writes_csv(&mut v, &rows, &[]).unwrap();
+        assert!(body(&v).lines().nth(1).unwrap().ends_with(",未测"));
+
+        // 已删除是真值，不是未测：这两格必须能区分开
+        let deleted = [Usage {
+            bytes: 0,
+            files: 0,
+            state: footprint::State::Missing,
+        }];
+        let mut v = Vec::new();
+        writes_csv(&mut v, &rows, &deleted).unwrap();
+        assert!(body(&v).lines().nth(1).unwrap().ends_with(",0,已删除"));
     }
 
     #[test]

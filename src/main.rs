@@ -5,6 +5,7 @@ mod csv;
 mod db;
 mod eventlog;
 mod export;
+mod footprint;
 mod log;
 mod report;
 mod service;
@@ -105,6 +106,9 @@ enum Cmd {
         /// 输出 JSON（给脚本/agent 消费，替代文本对齐表；仅 stdout，无其他输出）
         #[arg(long)]
         json: bool,
+        /// 跳过当前磁盘占用扫描（file/dir 维度默认会扫，目录很大时可用它换速度）
+        #[arg(long)]
+        no_usage: bool,
     },
     /// 导出 CSV（writes / usn / alerts 各一份，Excel 可直接打开）
     Export {
@@ -123,6 +127,9 @@ enum Cmd {
         /// 实时写入视图的聚合维度：file / dir / none（分钟明细）
         #[arg(long, default_value = "file")]
         by: String,
+        /// 跳过当前磁盘占用两列（明细视图本来就不带现值，此参数只对 file/dir 聚合生效）
+        #[arg(long)]
+        no_usage: bool,
     },
 }
 
@@ -235,6 +242,7 @@ fn main() -> Result<()> {
             limit,
             contains,
             json,
+            no_usage,
         } => top::run(
             &db_path,
             &last,
@@ -242,6 +250,7 @@ fn main() -> Result<()> {
             limit,
             contains.as_deref(),
             json,
+            !no_usage,
         ),
         Cmd::Export {
             last,
@@ -249,6 +258,7 @@ fn main() -> Result<()> {
             contains,
             process,
             by,
+            no_usage,
         } => export::run_cli(
             &db_path,
             &last,
@@ -256,6 +266,7 @@ fn main() -> Result<()> {
             contains.as_deref().unwrap_or(""),
             process.as_deref().unwrap_or(""),
             &by,
+            !no_usage,
         ),
     }
 }

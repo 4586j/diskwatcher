@@ -38,10 +38,7 @@ pub fn scan(db: &mut Db, from_ts: i64, threshold: u64) -> Result<()> {
         return Ok(());
     }
     let path = alerts_log_path()?;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
+    let mut f = log::open_capped(&path)
         .with_context(|| format!("打开告警日志 {} 失败", path.display()))?;
     let mut ids = Vec::with_capacity(pending.len());
     for a in &pending {

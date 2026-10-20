@@ -1,9 +1,10 @@
 /target
 
-# 运行时产物：数据库、日志、报告（生产数据不进版本库）
+# 运行时产物：数据库、日志、报告、导出的 CSV（生产数据不进版本库）
 /bin/data/
 /bin/logs/
 /bin/reports/
+/bin/exports/
 
 # 二进制：部署副本与历史备份（备份名形如 diskwatch.exe.bak-20260903，扩展名已变，须单独匹配）
 /bin/*.exe

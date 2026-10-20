@@ -97,12 +97,40 @@ function colsFor(view, group) {
   } };
   const notified = { label: '通知', cls: 'badge', render: r =>
     el('td', 'badge ' + (r.notified ? 'ok' : 'no'), r.notified ? '已推送' : '待推送') };
+  // 现值列不参与排序：它不在数据库里，服务端排序够不着，硬排会让分页骗人
+  const usage = { label: '当前占用', cls: 'num', render: r => {
+    const td = el('td', 'num', usageText(r.usage_state, r.usage_bytes));
+    const hint = usageHint(r.usage_state);
+    if (hint) td.title = hint;
+    return td;
+  } };
   if (view === 'writes') {
     if (group === 'none') return [rank, bytes, ops, tsCol, proc, path];
-    return [rank, bytes, ops, timeRange, proc, group === 'dir' ? dir : path];
+    return [rank, bytes, ops, usage, timeRange, proc, group === 'dir' ? dir : path];
   }
   if (view === 'usn') return [rank, size, group === 'dir' ? dir : path, tsCol];
   return [rank, tsCol, bytes, proc, path, notified];
+}
+
+// 四种状态各有含义，一律显示成 0 会把"没权限看"读成"不占空间"
+function usageText(state, bytes) {
+  switch (state) {
+    case 'missing': return '已删除';
+    case 'denied': return '需管理员';
+    case 'partial': return '≈' + humanBytes(bytes || 0);
+    case 'exact': return humanBytes(bytes || 0);
+    default: return '—';
+  }
+}
+
+function usageHint(state) {
+  switch (state) {
+    case 'partial': return '扫描达到条目/时限预算，这是下界';
+    case 'missing': return '写入后已被回收，当前不占磁盘';
+    case 'denied': return '无权限读取，用管理员身份运行 diskwatch 可取到真值';
+    case 'exact': return '';
+    default: return '本次未测量现值';
+  }
 }
 
 // ---------- 状态（hash 驱动，单一事实源） ----------
@@ -246,6 +274,17 @@ function mockDir(p) {
   const i = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
   return i > 2 ? p.slice(0, i) : 'C:\\';
 }
+// mock 只演示现值四种状态在表里的排布；真值来自服务端 usage_* 字段
+function mockUsage(key, bytes) {
+  let h = 0;
+  for (const c of key) h = (h * 131 + c.charCodeAt(0)) >>> 0;
+  switch (h % 6) {
+    case 0: return { usage_state: 'missing', usage_bytes: 0, usage_files: 0 };
+    case 1: return { usage_state: 'denied', usage_bytes: 0, usage_files: 0 };
+    case 2: return { usage_state: 'partial', usage_bytes: Math.round(bytes * 0.4), usage_files: 1240 };
+    default: return { usage_state: 'exact', usage_bytes: Math.round(bytes * 0.7), usage_files: 318 };
+  }
+}
 function mockGroupWrites(rows, group) {
   if (group === 'none') {
     return rows.map(w => ({
@@ -262,7 +301,7 @@ function mockGroupWrites(rows, group) {
     g.t0 = Math.min(g.t0, w.ts); g.t1 = Math.max(g.t1, w.ts);
     g.procs.add(w.process);
   }
-  return [...map.values()].map(g => ({ ...g, process: [...g.procs].join(',') }));
+  return [...map.values()].map(g => ({ ...g, ...mockUsage(g.path, g.bytes), process: [...g.procs].join(',') }));
 }
 function mockFilter(rows, params, opts) {
   const w = resolveWindow(params);
@@ -428,7 +467,8 @@ function mockDirsTop(params, n) {
     if (!g) { g = { dir: d, bytes: 0, ops: 0 }; map.set(d, g); }
     g.bytes += x.bytes; g.ops += x.ops;
   }
-  return [...map.values()].sort((a, b) => b.bytes - a.bytes).slice(0, n);
+  return [...map.values()].sort((a, b) => b.bytes - a.bytes).slice(0, n)
+    .map(d => ({ ...d, ...mockUsage(d.dir, d.bytes) }));
 }
 
 // ---------- 渲染 ----------
@@ -602,7 +642,14 @@ function renderRankings(ov) {
   const dirs = ov.dirs || [];
   if (dirs.length === 0) dirsBox.appendChild(el('div', 'note', '窗口内没有数据'));
   const maxD = dirs.reduce((m, d) => Math.max(m, d.bytes), 0);
-  dirs.forEach((d, i) => renderBarRow(dirsBox, d.dir, d.bytes, maxD, `${d.ops.toLocaleString()} 次写入`, i * 50,
+  const dirSub = d => {
+    const base = `${d.ops.toLocaleString()} 次写入`;
+    if (!d.usage_state) return base;
+    // 只有真量到字节数才说"现占"，否则"现占 需管理员"读不通
+    const measured = d.usage_state === 'exact' || d.usage_state === 'partial';
+    return `${base} · ${measured ? '现占 ' : ''}${usageText(d.usage_state, d.usage_bytes)}`;
+  };
+  dirs.forEach((d, i) => renderBarRow(dirsBox, d.dir, d.bytes, maxD, dirSub(d), i * 50,
     () => applyPatch({ q: d.dir, offset: 0 }, true)));
 }
 
@@ -742,6 +789,8 @@ function mainParams() {
   if (S.q) p.q = S.q;
   if (S.process && S.view !== 'usn') p.process = S.process;
   if (S.view === 'writes' || S.view === 'usn') p.group = S.group;
+  // 现值要扫盘，只在写入视图的聚合粒度上请求；明细视图没有这一列
+  if (S.view === 'writes' && S.group !== 'none') p.usage = '1';
   return p;
 }
 // 导出走的是全窗口，不是屏幕上这 50 行：继承筛选与聚合粒度，丢掉分页和排序。
@@ -780,7 +829,7 @@ async function loadTop() {
     if (S.q) w.q = S.q;
     let ov = null, st = null;
     if (S.view === 'writes') {
-      [ov, st] = await Promise.all([api('/api/overview', w), api('/api/status', {})]);
+      [ov, st] = await Promise.all([api('/api/overview', { ...w, usage: '1' }), api('/api/status', {})]);
     } else if (S.view === 'usn') {
       const res = await api('/api/usn', { ...w, group: 'dir', limit: 8, sort: 'bytes', order: 'desc' });
       ov = { dirs: (res.rows || []).map(r => ({ dir: r.path, bytes: r.bytes, ops: 0 })) };
